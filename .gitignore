@@ -1,0 +1,8 @@
+# Built from your own dump: never committed.
+build/
+*.3ds
+*.cci
+*.cxi
+*.cia
+*.dll
+*.so

@@ -1,0 +1,12 @@
+# from a save in the bedroom: title, continue, walk around
+wait 500
+spam a 12 90
+wait 200
+stick 1 0 60
+wait 20
+stick 0 -1 60
+wait 20
+stick -1 0 60
+wait 20
+stick 0 1 60
+wait 60

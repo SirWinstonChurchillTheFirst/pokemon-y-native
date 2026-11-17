@@ -1,0 +1,705 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 587cbc6..bd4d668 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -57,6 +57,12 @@ FetchContent_Declare(cityhash GIT_REPOSITORY https://github.com/google/cityhash.
+                      GIT_TAG f5dc54147fcce12cefd16548c8e760d68ac04226)
+ FetchContent_MakeAvailable(cityhash)
+ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/cityhash/config.h "/* CityHash's configure would write this; city.cc needs nothing of it */\n")
++# local (MinGW build on Windows): city.cc wants glibc's byteswap.h there
++if(MINGW)
++    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/cityhash/byteswap.h "#define bswap_32(x) __builtin_bswap32(x)
++#define bswap_64(x) __builtin_bswap64(x)
++")
++endif()
+ add_library(cityhash STATIC ${cityhash_SOURCE_DIR}/src/city.cc)
+ target_include_directories(cityhash PUBLIC ${cityhash_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/cityhash)
+ target_compile_options(cityhash PRIVATE -w)
+@@ -160,7 +166,7 @@ if(RUNTIME_VULKAN)
+     # Windows SDK, linked in; else glslang alone (fetched; Linux, whose
+     # distributions' shaderc_combined leaves glslang out, and Android)
+     target_link_libraries(recomp_runtime PUBLIC volk)
+-    if(WIN32 AND TARGET Vulkan::shaderc_combined)
++    if(WIN32 AND NOT MINGW AND TARGET Vulkan::shaderc_combined)  # local: MinGW's shaderc_combined leaves glslang out too
+         target_link_libraries(recomp_runtime PUBLIC Vulkan::shaderc_combined)
+     else()
+         FetchContent_Declare(glslang GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git GIT_TAG 16.4.0 GIT_SHALLOW TRUE)
+diff --git a/frontend/layouts.cpp b/frontend/layouts.cpp
+index 81318b2..7fe8d8a 100644
+--- a/frontend/layouts.cpp
++++ b/frontend/layouts.cpp
+@@ -47,9 +47,32 @@ void place_stacked(VulkanPresenter::View &view) {
+     view.placements = {fill, top, bottom};
+ }
+ 
++void place_side(VulkanPresenter::View &view, bool swapped) {
++    const float large = swapped ? 320 : view.top, small = (swapped ? view.top : 320) * SIDE_SMALL, both = large + small;
++    float shape = view.height ? float(view.width) / float(view.height) : both / 240;
++    // the window's shape around the two, so the fill reaches its edges
++    float w = std::max(both, 240 * shape), h = w / shape;
++    view.canvas[0] = w, view.canvas[1] = h;
++    // the fill covers the canvas, the top screen's shape kept
++    float fw = std::max(w, h * view.top / 240), fh = fw * 240 / view.top;
++    Placement fill;
++    fill.to[0] = (w - fw) / 2, fill.to[1] = (h - fh) / 2, fill.to[2] = fill.to[0] + fw, fill.to[3] = fill.to[1] + fh;
++    fill.brightness = 0.4f;
++    fill.blur = 6;
++    const float x = (w - both) / 2, y = (h - 240) / 2;
++    Placement first;
++    first.screen = swapped ? 1 : 0;
++    first.to[0] = x, first.to[1] = y, first.to[2] = x + large, first.to[3] = y + 240;
++    Placement second;
++    second.screen = swapped ? 0 : 1;
++    second.to[0] = x + large, second.to[1] = y + 240 * (1 - SIDE_SMALL), second.to[2] = x + both, second.to[3] = y + 240;
++    view.placements = {fill, first, second};
++}
++
+ void place(VulkanPresenter::View &view, const std::string &layout, float shown, float size, const std::string &corner,
+            float lift) {
+     if (layout == "stacked") place_stacked(view);
++    else if (layout == "side") place_side(view);
+     else place_single(view, layout == "top" ? 0.0f : shown, size, corner, lift);
+ }
+ 
+diff --git a/frontend/layouts.h b/frontend/layouts.h
+index 0a33fba..40fd69d 100644
+--- a/frontend/layouts.h
++++ b/frontend/layouts.h
+@@ -7,6 +7,10 @@
+ //   "stacked" both screens one over the other, the sides filled with the top
+ //             one blurred and dimmed
+ //   "top"     the top screen alone
++// and the setting's own, whatever the scene:
++//   "side"    both screens side by side, the top one large on the left, the
++//             bottom one smaller at its right, the rest of the window filled
++//             with the top one blurred and dimmed
+ #ifndef FRONTEND_LAYOUTS_H
+ #define FRONTEND_LAYOUTS_H
+ 
+@@ -27,8 +31,20 @@ void place_single(runtime::VulkanPresenter::View &view, float shown, float size,
+ // filled with the top screen blurred and dimmed
+ void place_stacked(runtime::VulkanPresenter::View &view);
+ 
+-// the layout by its name ("panel", "stacked", "top"; the panel shown as
+-// much as shown)
++// side by side: the small screen's size against the large one's, a 3DS
++// pixel of each (0.625: 1280x768 beside 640x480 in a window of 1920x1080,
++// its whole width used)
++constexpr float SIDE_SMALL = 0.625f;
++
++// both screens side by side on a canvas of the window's shape: the top one
++// at the left, the bottom one SIDE_SMALL of its size at its right, their
++// lower edges level, the two centered; the canvas filled with the top
++// screen blurred and dimmed. swapped (the player's L2): the bottom one the
++// large one, the top one small at its right
++void place_side(runtime::VulkanPresenter::View &view, bool swapped = false);
++
++// the layout by its name ("panel", "stacked", "top", "side"; the panel
++// shown as much as shown)
+ void place(runtime::VulkanPresenter::View &view, const std::string &layout, float shown, float size, const std::string &corner,
+            float lift = 0);
+ 
+diff --git a/frontend/overlay.cpp b/frontend/overlay.cpp
+index aa6d870..272d191 100644
+--- a/frontend/overlay.cpp
++++ b/frontend/overlay.cpp
+@@ -130,9 +130,9 @@ void Overlay::draw(Settings &s, const Stats &stats, const std::filesystem::path
+             if (s.video.between) moved |= ImGui::Checkbox("Up to the display's rate (120, 144 Hz)", &s.video.between_display);
+             if (s.video.between) moved |= ImGui::Checkbox("Debug: frames between without motion", &s.video.between_still);
+             moved |= ImGui::Checkbox("Vertical sync (can cost speed)", &s.video.vsync);
+-            int layout = s.video.layout == "top" ? 1 : s.video.layout == "single" ? 2 : 0;
+-            if (ImGui::Combo("Screens", &layout, "Both, stacked\0Top only\0Single screen (Tab, L3: the bottom one)\0")) {
+-                s.video.layout = layout == 1 ? "top" : layout == 2 ? "single" : "both";
++            int layout = s.video.layout == "top" ? 1 : s.video.layout == "single" ? 2 : s.video.layout == "side" ? 3 : 0;
++            if (ImGui::Combo("Screens", &layout, "Both, stacked\0Top only\0Single screen (Tab, L3: the bottom one)\0Both, side by side\0")) {
++                s.video.layout = layout == 1 ? "top" : layout == 2 ? "single" : layout == 3 ? "side" : "both";
+                 moved = true;
+             }
+             if (s.video.layout == "single") {
+diff --git a/frontend/player.cpp b/frontend/player.cpp
+index bda6585..a9a8178 100644
+--- a/frontend/player.cpp
++++ b/frontend/player.cpp
+@@ -183,11 +183,14 @@ private:
+ 
+ // how many of the host's pixels a 3DS pixel is drawn as, each way: as many
+ // as fill the resolution asked for (a size, or the window's) with the
+-// screens shown, both stacked (480 rows) or the top one alone (240)
++// screens shown, both stacked (480 rows) or the top one alone (240); side
++// by side, the top one with the small bottom one beside it
+ float resolution_scale(const Settings &s, bool both, int window_width, int window_height) {
+     float width = 0, height = 0;
+     if (s.video.resolution == "window") width = float(window_width), height = float(window_height);
+     else if (std::sscanf(s.video.resolution.c_str(), "%fx%f", &width, &height) != 2) return 1;
++    if (s.video.layout == "side")
++        return std::clamp(std::min(width / (top_width(s) + 320 * frontend::SIDE_SMALL), height / 240.0f), 1.0f, 8.0f);
+     return std::clamp(std::min(width / top_width(s), height / (both ? 480.0f : 240.0f)), 1.0f, 8.0f);
+ }
+ 
+@@ -276,6 +279,12 @@ void start_overlay(SDL_Window *window, VulkanPresenter &presenter, const std::st
+ // as the DSP's clock and the sound card's drift apart; a quarter of a
+ // second queued at most, the rest is late
+ void feed_sound(SDL_AudioStream *sound, std::vector<int16_t> &out, std::atomic<uint64_t> &starved) {
++    // local (tests): RUNTIME_SOUND_DUMP=<file> keeps what the game played, raw 16-bit stereo
++    if (!out.empty()) {
++        static const char *dump_name = SDL_getenv("RUNTIME_SOUND_DUMP");
++        static std::FILE *dump_file = dump_name ? std::fopen(dump_name, "wb") : nullptr;
++        if (dump_file) std::fwrite(out.data(), 2, out.size(), dump_file), std::fflush(dump_file);
++    }
+     if (!sound || out.empty()) return;
+     constexpr int BYTES_PER_SECOND = int(AUDIO_RATE) * 4, TARGET = BYTES_PER_SECOND * 60 / 1000;
+     int queued = SDL_GetAudioStreamQueued(sound);
+@@ -421,16 +430,20 @@ struct Recorder {
+ struct Dump {
+     const char *folder = SDL_getenv("RUNTIME_DUMP");
+     int left = SDL_getenv("RUNTIME_DUMP_COUNT") ? std::atoi(SDL_getenv("RUNTIME_DUMP_COUNT")) : 600;
++    int skip = SDL_getenv("RUNTIME_DUMP_SKIP") ? std::atoi(SDL_getenv("RUNTIME_DUMP_SKIP")) : 0; // shown frames left out first
+ 
+     void take(const Frame &f) {
+         if (!folder || left <= 0 || f.screens[0].rgba.empty()) return;
++        if (skip > 0) { skip--; return; }
+         left--;
+         char name[512];
+         std::snprintf(name, sizeof name, "%s/%06llu-%d-%s.ppm", folder, (unsigned long long)f.number, f.part, f.between ? "between" : "game");
+         const Picture &p = f.screens[0];
+         std::ofstream out(frontend::path_of(name), std::ios::binary);
+         out << "P6\n" << p.width << " " << p.height << "\n255\n";
+-        for (size_t i = 0; i < p.rgba.size(); i += 4) out.write(reinterpret_cast<const char *>(&p.rgba[i]), 3);
++        std::string rgb(p.rgba.size() / 4 * 3, 0);
++        for (size_t i = 0, o = 0; i < p.rgba.size(); i += 4, o += 3) rgb[o] = char(p.rgba[i]), rgb[o + 1] = char(p.rgba[i + 1]), rgb[o + 2] = char(p.rgba[i + 2]);
++        out.write(rgb.data(), std::streamsize(rgb.size()));
+     }
+ };
+ 
+@@ -723,6 +736,43 @@ int main(int argc, char **argv) {
+                 std::lock_guard g(input_lock);
+                 handlers.input = input;
+             }
++            // local (tests): RUNTIME_PLAY_INPUT=<recording> plays a recording's input
++            // (the format above, as boot's RUNTIME_REPLAY) in the player itself, and
++            // RUNTIME_PLAY_FRAMES=n ends the player at that vertical blank
++            {
++                struct Step { uint64_t frame; uint32_t buttons; float x, y; int tx, ty; };
++                static std::vector<Step> steps;
++                static size_t next = 0;
++                static Step current{0, 0, 0, 0, -1, -1};
++                static bool loaded = false;
++                static uint64_t stop_at = 0;
++                if (!loaded) {
++                    loaded = true;
++                    if (const char *frames = SDL_getenv("RUNTIME_PLAY_FRAMES")) stop_at = std::strtoull(frames, nullptr, 10);
++                    if (const char *file = SDL_getenv("RUNTIME_PLAY_INPUT")) {
++                        std::ifstream in(file);
++                        std::string line;
++                        std::getline(in, line);
++                        while (std::getline(in, line)) {
++                            Step st{};
++                            unsigned buttons = 0;
++                            if (std::sscanf(line.c_str(), "%llu %x %f %f %d %d", (unsigned long long *)&st.frame, &buttons, &st.x, &st.y, &st.tx, &st.ty) == 6) {
++                                st.buttons = buttons;
++                                steps.push_back(st);
++                            }
++                        }
++                    }
++                }
++                if (!steps.empty()) {
++                    while (next < steps.size() && steps[next].frame <= handlers.vblanks) current = steps[next++];
++                    handlers.input.buttons = current.buttons;
++                    handlers.input.circle_x = current.x;
++                    handlers.input.circle_y = current.y;
++                    handlers.input.touch.reset();
++                    if (current.tx >= 0) handlers.input.touch = std::make_pair(uint16_t(current.tx), uint16_t(current.ty));
++                }
++                if (stop_at && handlers.vblanks >= stop_at) quit = true;
++            }
+             recorder.take(handlers.vblanks, handlers.input);
+             if (!cheats_on.empty() && handlers.vblanks != cheat_blank) {
+                 cheat_blank = handlers.vblanks;
+@@ -866,6 +916,20 @@ int main(int argc, char **argv) {
+             showing = std::move(waiting.front());
+             waiting.pop_front();
+             dump.take(showing);
++        }
++        // the game's blanks at the display's own rate, a picture kept waiting: none left when
++        // this one was taken, the game a little faster; two, a little slower
++        if (settings.video.vsync && !std::getenv("RUNTIME_NO_DISPLAY_SYNC")) {
++            const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
++            double hz = mode && mode->refresh_rate > 0 ? mode->refresh_rate : 60.0;
++            hz /= std::max(1L, std::lround(hz / 60.0));
++            if (std::abs(hz - 59.83) < 1.5) {
++                const size_t left = waiting.size();
++                const double trim = left == 0 ? 0.002 : left >= 2 ? -0.002 : 0.0;
++                handlers.vblank_ticks.store(uint64_t(double(CPU_CLOCK_HZ) / hz * (1.0 - trim)), std::memory_order_relaxed);
++            }
++        }
++        if (fresh) {
+         } else if (!settings.video.vsync && !overlay.open) {
+             // nothing new, and no refresh to wait for
+             SDL_Delay(1);
+@@ -958,8 +1022,10 @@ int main(int argc, char **argv) {
+             frontend::place(view, layout, panel, settings.video.panel_size, settings.video.panel_corner, scene ? scene->lift : 0.0f);
+         } else {
+             ui_up = false;
++            // side by side whatever the scene, the swap its own
++            if (layout == "side") frontend::place_side(view, swapped);
+         }
+-        if (swapped) frontend::swap_screens(view);
++        if (swapped && layout != "side") frontend::swap_screens(view);
+         // in the window's pixels, eased from the layout before (a swap too:
+         // each screen moves to the other's place)
+         frontend::in_window(view);
+diff --git a/frontend/settings.h b/frontend/settings.h
+index eb19a7b..3de7f29 100644
+--- a/frontend/settings.h
++++ b/frontend/settings.h
+@@ -48,8 +48,9 @@ struct Settings {
+         // and as many more as the display's refresh rate shows (120, 144 Hz...)
+         bool between_display = false;
+         bool between_still = false; // debugging: the frames between with no motion
+-        // both screens stacked, "top" alone, or "single": the top one with
+-        // the bottom one as a panel on a button
++        // both screens stacked, "top" alone, "single": the top one with
++        // the bottom one as a panel on a button, or "side": both side by
++        // side, whatever the scene
+         std::string layout = "both";
+         // the single screen's panel: its size (of the bottom screen's own,
+         // the top screen's height being 240) and the corner it sits in
+diff --git a/include/runtime/memory.h b/include/runtime/memory.h
+index 8084db7..bda584f 100644
+--- a/include/runtime/memory.h
++++ b/include/runtime/memory.h
+@@ -7,6 +7,7 @@
+ #ifndef RUNTIME_MEMORY_H
+ #define RUNTIME_MEMORY_H
+ 
++#include <mutex>
+ #include <cstdint>
+ #include <functional>
+ #include <map>
+@@ -135,6 +136,8 @@ private:
+     std::vector<uint8_t> fcram_, vram_, dsp_, axi_;
+     std::vector<uint8_t *> read_, write_, cpu_read_, cpu_write_;
+     std::map<uint32_t, uint32_t> guards_[2]; // start to end, for reads and writes
++    // the GPU's thread guards while the game's unguards: one at a time
++    mutable std::recursive_mutex guards_lock_;
+     void unguard(uint32_t a, uint32_t size, bool write);
+     bool guarded(size_t page, bool write) const;
+     std::vector<bool> allocated_;
+diff --git a/include/runtime/services.h b/include/runtime/services.h
+index 797be39..8e47a86 100644
+--- a/include/runtime/services.h
++++ b/include/runtime/services.h
+@@ -7,6 +7,7 @@
+ #ifndef RUNTIME_SERVICES_H
+ #define RUNTIME_SERVICES_H
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <functional>
+ #include <map>
+@@ -75,6 +76,13 @@ struct Input {
+ };
+ 
+ class Services {
++public:
++    // a vertical blank's length in ticks: the 3DS's 59.83 Hz, or the display's own rate as
++    // the player sets it (so every refresh has a picture)
++    std::atomic<uint64_t> vblank_ticks{CPU_CLOCK_HZ * 100 / 5983};
++
++private:
++
+ public:
+     explicit Services(uint64_t program_id) : program_id_(program_id) {}
+ 
+diff --git a/launcher/main.cpp b/launcher/main.cpp
+index 5f1737e..fa14e1d 100644
+--- a/launcher/main.cpp
++++ b/launcher/main.cpp
+@@ -11,6 +11,7 @@
+ // launcher run again with `--build-full <title>`, and is used from the next
+ // start. Drawn with Dear ImGui on SDL's renderer (Direct3D 11 on Windows).
+ 
++#include <algorithm>
+ #include "android.h"
+ #include "build.h"
+ #include "check.h"
+diff --git a/launcher/pages.cpp b/launcher/pages.cpp
+index f296705..1842b39 100644
+--- a/launcher/pages.cpp
++++ b/launcher/pages.cpp
+@@ -78,7 +78,10 @@ void PlayerPages::set_record(bool on) {
+ 
+ std::string PlayerPages::summary() const {
+     const auto &v = settings_.video;
+-    std::string layout = v.layout == "single" ? "Single screen" : v.layout == "top" ? "Top screen only" : "Both screens";
++    std::string layout = v.layout == "single" ? "Single screen"
++                         : v.layout == "top"  ? "Top screen only"
++                         : v.layout == "side" ? "Side by side"
++                                              : "Both screens";
+     std::string resolution = v.resolution == "native" ? "Console resolution" : v.resolution == "window" ? "Window resolution" : v.resolution;
+     if (auto x = resolution.find('x'); x != std::string::npos && v.resolution != "native" && v.resolution != "window")
+         resolution.replace(x, 1, " × ");
+@@ -101,7 +104,7 @@ void PlayerPages::graphics(ImU32 accent, const std::vector<runtime::DecompOption
+ 
+     look::section("Screens", accent);
+     look::row("Layout", "Single screen: the top screen, the bottom one as a panel (Tab, L3). L2 swaps them.", wide, [&] {
+-        changed |= choice("##layout", v.layout, {{"single", "Single screen"}, {"both", "Both screens, stacked"}, {"top", "Top screen only"}});
++        changed |= choice("##layout", v.layout, {{"single", "Single screen"}, {"both", "Both screens, stacked"}, {"side", "Both screens, side by side"}, {"top", "Top screen only"}});
+     });
+     if (v.layout == "single") {
+         look::row("Panel size", "The bottom screen's panel, against the top screen's height.", wide,
+diff --git a/src/memory.cpp b/src/memory.cpp
+index 0a007c0..919c3f8 100644
+--- a/src/memory.cpp
++++ b/src/memory.cpp
+@@ -204,6 +204,7 @@ void Memory::write32(uint32_t a, uint32_t v) {
+ // not bring the other down
+ void Memory::guard(uint32_t vaddr, uint32_t size, bool write) {
+     if (!size) return;
++    std::lock_guard lock(guards_lock_);
+     auto &guards = guards_[write];
+     uint64_t start = vaddr, end = uint64_t(vaddr) + size;
+     end = std::min<uint64_t>(end, 0xFFFFFFFF);
+@@ -224,6 +225,7 @@ void Memory::guard(uint32_t vaddr, uint32_t size, bool write) {
+ }
+ 
+ bool Memory::guarded(size_t page, bool write) const {
++    std::lock_guard lock(guards_lock_);
+     auto &guards = guards_[write];
+     uint64_t start = uint64_t(page) << PAGE_BITS, end = start + PAGE_SIZE;
+     auto it = guards.lower_bound(uint32_t(std::min<uint64_t>(end, 0xFFFFFFFF)));
+@@ -237,16 +239,23 @@ void Memory::unguard(uint32_t a, uint32_t size, bool write) {
+     auto &guards = guards_[write];
+     uint64_t end = uint64_t(a) + std::max(size, 1u);
+     std::vector<std::pair<uint32_t, uint32_t>> hit;
+-    for (auto it = guards.lower_bound(uint32_t(std::min<uint64_t>(end, 0xFFFFFFFF))); it != guards.begin();) {
+-        --it;
+-        if (it->second <= a) break;
+-        hit.push_back(*it);
+-        it = guards.erase(it);
++    {
++        std::lock_guard lock(guards_lock_);
++        for (auto it = guards.lower_bound(uint32_t(std::min<uint64_t>(end, 0xFFFFFFFF))); it != guards.begin();) {
++            --it;
++            if (it->second <= a) break;
++            hit.push_back(*it);
++            it = guards.erase(it);
++        }
+     }
+     auto &table = write ? cpu_write_ : cpu_read_;
+     auto &from = write ? write_ : read_;
++    // the GPU's thread is waited for without the lock: it may be guarding
+     for (auto [start, stop] : hit) {
+         if (gpu_sync) gpu_sync(start, stop - start, write);
++    }
++    std::lock_guard lock(guards_lock_);
++    for (auto [start, stop] : hit) {
+         for (size_t page = start >> PAGE_BITS; page <= (stop - 1) >> PAGE_BITS; page++) {
+             if (!guarded(page, write)) table[page] = from[page];
+         }
+diff --git a/src/services/services.cpp b/src/services/services.cpp
+index 9df4754..7a49b86 100644
+--- a/src/services/services.cpp
++++ b/src/services/services.cpp
+@@ -345,7 +345,7 @@ void Services::tick(System &system) {
+     }
+     // the screens refresh 60 times a second (the 3DS's 59.83)
+     if (gpu && gsp_.shared) {
+-        constexpr uint64_t FRAME = CPU_CLOCK_HZ * 100 / 5983;
++        const uint64_t FRAME = vblank_ticks.load(std::memory_order_relaxed);
+         if (!gsp_.next_vblank) gsp_.next_vblank = now + FRAME;
+         if (now >= gsp_.next_vblank) {
+             gsp_.next_vblank = std::max(gsp_.next_vblank + FRAME, now);
+diff --git a/src/vk/device.cpp b/src/vk/device.cpp
+index fe3877c..cc5fdb5 100644
+--- a/src/vk/device.cpp
++++ b/src/vk/device.cpp
+@@ -1,3 +1,8 @@
++#ifdef __linux__
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
+ // The Vulkan device: set up, buffers and images, recording and submitting. (impl.h)
+ 
+ #include "impl.h"
+@@ -198,6 +203,26 @@ bool Impl::init() {
+     if (api_version < VK_API_VERSION_1_3) extensions.insert(extensions.end(), std::begin(BEFORE_1_3), std::end(BEFORE_1_3));
+     if (api_version < VK_API_VERSION_1_2) extensions.insert(extensions.end(), std::begin(BEFORE_1_2), std::end(BEFORE_1_2));
+     if (can_present) extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
++    // pipeline libraries, where the device has them (RUNTIME_NO_PIPELINE_LIBRARY=1: without)
++    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
++    {
++        auto named = [&](const char *e) { return std::find(device_extensions.begin(), device_extensions.end(), std::string(e)) != device_extensions.end(); };
++        if (api_version >= VK_API_VERSION_1_3 && named(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
++            named(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) && !std::getenv("RUNTIME_NO_PIPELINE_LIBRARY")) {
++            VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT can{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
++            VkPhysicalDeviceFeatures2 ask{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++            ask.pNext = &can;
++            vkGetPhysicalDeviceFeatures2(physical, &ask);
++            if (can.graphicsPipelineLibrary) {
++                extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
++                extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
++                gpl.graphicsPipelineLibrary = VK_TRUE;
++                gpl.pNext = features.pNext;
++                features.pNext = &gpl;
++                pipeline_libraries = true;
++            }
++        }
++    }
+     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+     dci.pNext = &features;
+     dci.queueCreateInfoCount = 1;
+@@ -702,8 +727,48 @@ VkDeviceSize Impl::take(Buffer &ring, VkDeviceSize &at, VkDeviceSize size, VkDev
+     return where;
+ }
+ 
++void Impl::warm() {
++#ifdef __linux__
++    setpriority(PRIO_PROCESS, pid_t(syscall(SYS_gettid)), 10);
++#endif
++    auto t0 = std::chrono::steady_clock::now();
++    std::error_code error;
++    std::vector<std::filesystem::path> files;
++    for (const auto &entry : std::filesystem::directory_iterator(cache_folder, error)) {
++        if (entry.path().extension() == ".spv") files.push_back(entry.path());
++    }
++    int made = 0;
++    for (const auto &file : files) {
++        if (stop_warming) break;
++        std::vector<uint32_t> words;
++        if (FILE *f = open_file(file, "rb")) {
++            std::fseek(f, 0, SEEK_END);
++            long size = std::ftell(f);
++            std::fseek(f, 0, SEEK_SET);
++            if (size > 0 && size % 4 == 0) {
++                words.resize(size_t(size) / 4);
++                if (std::fread(words.data(), 4, words.size(), f) != words.size()) words.clear();
++            }
++            std::fclose(f);
++        }
++        if (words.empty()) continue;
++        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        smi.codeSize = words.size() * 4;
++        smi.pCode = words.data();
++        VkShaderModule module = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(device, &smi, nullptr, &module) != VK_SUCCESS) continue;
++        warm_modules.push_back(module); // kept: a library is named by its module
++        if (VkPipeline pipe = make_pipeline(uint64_t(1) << 41, true, module)) vkDestroyPipeline(device, pipe, nullptr), made++;
++    }
++    if (std::getenv("RUNTIME_STATS"))
++        std::printf("warmed %d of %zu vertex shaders in %.0f ms\n", made, files.size(),
++                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
++}
++
+ void Impl::shutdown() {
+     if (!device) return;
++    stop_warming = true;
++    if (warming.joinable()) warming.join();
+     vkDeviceWaitIdle(device);
+     translator.reset();
+     if (pipeline_cache) {
+@@ -724,6 +789,12 @@ void Impl::shutdown() {
+     for (auto &[k, t] : textures) destroy(t.image);
+     destroy(blank);
+     for (auto &[k, pipe] : pipelines) vkDestroyPipeline(device, pipe, nullptr);
++    for (auto &[k, l] : libraries) {
++        if (l && l->pipe) vkDestroyPipeline(device, l->pipe, nullptr);
++    }
++    libraries.clear();
++    for (VkShaderModule m : warm_modules) vkDestroyShaderModule(device, m, nullptr);
++    warm_modules.clear();
+     for (auto &[k, s] : samplers) vkDestroySampler(device, s, nullptr);
+     for (Buffer &b : staging) destroy(b);
+     for (Shown &sh : shown) {
+diff --git a/src/vk/draw.cpp b/src/vk/draw.cpp
+index efa8490..ea89e01 100644
+--- a/src/vk/draw.cpp
++++ b/src/vk/draw.cpp
+@@ -109,6 +109,84 @@ VkPipeline Impl::make_pipeline(uint64_t key, bool has_depth, VkShaderModule vert
+     gi.pDynamicState = &dyn;
+     gi.layout = layout;
+     VkPipeline pipe = VK_NULL_HANDLE;
++    if (pipeline_libraries) {
++        // the vertex shader with its inputs: once a shader
++        std::string name = "V";
++        uint64_t handle = uint64_t(vertex);
++        name.append(reinterpret_cast<const char *>(&handle), sizeof handle);
++        name.push_back(on_gpu ? 1 : 0);
++        VkPipeline before = library(name, [&] {
++            VkGraphicsPipelineLibraryCreateInfoEXT part{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
++            part.pNext = &ri;
++            part.flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT | VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
++            VkGraphicsPipelineCreateInfo li{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            li.pNext = &part;
++            li.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
++            li.stageCount = 1;
++            li.pStages = &stages[0];
++            li.pVertexInputState = &vin;
++            li.pInputAssemblyState = &ia;
++            li.pViewportState = &vp;
++            li.pRasterizationState = &rs;
++            li.pDynamicState = &dyn;
++            li.layout = layout;
++            VkPipeline made = VK_NULL_HANDLE;
++            vkCreateGraphicsPipelines(device, pipeline_cache, 1, &li, nullptr, &made);
++            return made;
++        });
++        // the fragment shader of a shape (none: the one for every state): once a shape
++        name = "F";
++        name.push_back(shadow ? 2 : w_buffer ? 1 : 0);
++        if (shape) name.append(reinterpret_cast<const char *>(shape), SHAPE_SIZE * 4);
++        VkPipeline shading = library(name, [&] {
++            VkGraphicsPipelineLibraryCreateInfoEXT part{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
++            part.pNext = &ri;
++            part.flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
++            VkGraphicsPipelineCreateInfo li{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            li.pNext = &part;
++            li.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
++            li.stageCount = 1;
++            li.pStages = &stages[1];
++            li.pMultisampleState = &ms;
++            li.pDepthStencilState = &ds;
++            li.pDynamicState = &dyn;
++            li.layout = layout;
++            VkPipeline made = VK_NULL_HANDLE;
++            vkCreateGraphicsPipelines(device, pipeline_cache, 1, &li, nullptr, &made);
++            return made;
++        });
++        // the blending and the targets
++        name = "O";
++        uint64_t state = key & ~(uint64_t(1) << 41);
++        name.append(reinterpret_cast<const char *>(&state), sizeof state);
++        name.push_back(has_depth ? 1 : 0);
++        VkPipeline output = library(name, [&] {
++            VkGraphicsPipelineLibraryCreateInfoEXT part{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
++            part.pNext = &ri;
++            part.flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
++            VkGraphicsPipelineCreateInfo li{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            li.pNext = &part;
++            li.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
++            li.pMultisampleState = &ms;
++            li.pColorBlendState = &cb;
++            li.pDynamicState = &dyn;
++            li.layout = layout;
++            VkPipeline made = VK_NULL_HANDLE;
++            vkCreateGraphicsPipelines(device, pipeline_cache, 1, &li, nullptr, &made);
++            return made;
++        });
++        if (before && shading && output) {
++            VkPipeline parts[3] = {before, shading, output};
++            VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
++            linked.libraryCount = 3;
++            linked.pLibraries = parts;
++            VkGraphicsPipelineCreateInfo li{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            li.pNext = &linked;
++            li.layout = layout;
++            if (vkCreateGraphicsPipelines(device, pipeline_cache, 1, &li, nullptr, &pipe) == VK_SUCCESS && pipe) return pipe;
++            pipe = VK_NULL_HANDLE;
++        }
++    }
+     vkCreateGraphicsPipelines(device, pipeline_cache, 1, &gi, nullptr, &pipe);
+     return pipe;
+ }
+diff --git a/src/vk/impl.h b/src/vk/impl.h
+index e594d03..4bc3737 100644
+--- a/src/vk/impl.h
++++ b/src/vk/impl.h
+@@ -22,6 +22,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <memory>
++#include <string>
+ #include <atomic>
+ #include <mutex>
+ #include <thread>
+@@ -249,6 +250,42 @@ struct VulkanRenderer::Impl {
+     VkPipeline depth_pipeline = VK_NULL_HANDLE;
+     VkSampler nearest = VK_NULL_HANDLE;
+     std::unordered_map<uint64_t, VkPipeline> pipelines;
++    // pipeline libraries (VK_EXT_graphics_pipeline_library): each vertex shader, each fragment
++    // shader of a shape and each output state compiled once, a pipeline only links them
++    bool pipeline_libraries = false;
++    struct Library {
++        std::mutex making;
++        VkPipeline pipe = VK_NULL_HANDLE;
++        bool made = false;
++    };
++    // the vertex shaders of the runs before (the cache's .spv), their libraries made in the
++    // background from the start, so the driver's cache has them before the game draws with them
++    std::thread warming;
++    std::atomic<bool> stop_warming{false};
++    std::vector<VkShaderModule> warm_modules;
++    void warm();
++    mutable std::mutex library_lock;
++    mutable std::map<std::string, std::shared_ptr<Library>> libraries;
++    template <class Make> VkPipeline library(const std::string &name, Make make) const {
++        std::shared_ptr<Library> l;
++        {
++            std::lock_guard g(library_lock);
++            auto &slot = libraries[name];
++            if (!slot) slot = std::make_shared<Library>();
++            l = slot;
++        }
++        std::lock_guard g(l->making);
++        if (!l->made) {
++            auto t0 = std::chrono::steady_clock::now();
++            l->pipe = make();
++            l->made = true;
++            if (std::getenv("RUNTIME_STATS"))
++                std::printf("library %c %.0f ms%s\n", name[0],
++                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
++                            l->pipe ? "" : " (failed)");
++        }
++        return l->pipe;
++    }
+     VkPipelineCache pipeline_cache = VK_NULL_HANDLE; // kept on disk with the translated shaders
+     // the game's vertex programs as shaders of their own (translate.h);
+     // RUNTIME_NO_TRANSLATE=1 keeps the interpreter
+diff --git a/src/vk/renderer.cpp b/src/vk/renderer.cpp
+index 804578f..e64e803 100644
+--- a/src/vk/renderer.cpp
++++ b/src/vk/renderer.cpp
+@@ -64,6 +64,7 @@ void VulkanRenderer::cache_in(const std::string &folder) {
+     Impl &d = *impl_;
+     d.cache_folder = std::filesystem::u8path(folder);
+     if (d.translator) d.translator->cache_in(d.cache_folder);
++    if (d.pipeline_libraries && !d.warming.joinable() && !std::getenv("RUNTIME_NO_WARM")) d.warming = std::thread([&d] { d.warm(); });
+     // the driver's pipelines from the last run, merged into the cache
+     if (FILE *f = open_file(d.cache_folder / "pipelines.bin", "rb")) {
+         std::vector<uint8_t> data;
+diff --git a/src/vk/translate.cpp b/src/vk/translate.cpp
+index a4f4848..0975190 100644
+--- a/src/vk/translate.cpp
++++ b/src/vk/translate.cpp
+@@ -1,3 +1,6 @@
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ // The PICA's vertex programs as GLSL (translate.h). Each instruction is
+ // decoded here once: its operands, swizzles and mask are written into the
+ // code, so the GPU only does the arithmetic. The flow (calls, ifs, loops,
+@@ -317,6 +320,7 @@ std::string translated_shader(const ProgramBlock &program, uint32_t entry, bool
+ 
+ Translator::Translator(VkDevice device, MakePipeline make, bool store) : device_(device), make_(std::move(make)), store_(store) {
+     unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u);
++    if (const char *e__ = std::getenv("RUNTIME_PIPELINE_THREADS")) n = std::clamp(unsigned(std::atoi(e__)), 1u, 16u);
+     for (unsigned i = 0; i < n; i++) threads_.emplace_back([this] { run(); });
+ }
+ 
+@@ -503,7 +507,15 @@ void Translator::run() {
+             std::lock_guard g(lock_);
+             module = shaders_[work.shader_key].module;
+         }
++        auto t0__ = std::chrono::steady_clock::now();
+         VkPipeline pipe = make_(work.key, work.has_depth, module, work.shape_hash ? work.shape.data() : nullptr);
++        if (std::getenv("RUNTIME_STATS")) {
++            size_t left__;
++            { std::lock_guard g(lock_); left__ = queue_.size() + later_.size(); }
++            std::printf("pipeline %.0f ms, shape %016llx, vertex %016llx, waiting %zu\n",
++                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0__).count(),
++                        (unsigned long long)work.shape_hash, (unsigned long long)work.shader_key, left__);
++        }
+         if (!pipe) std::fprintf(stderr, "a pipeline was not made\n");
+         std::lock_guard g(lock_);
+         pipelines_[{work.shader_key, work.key, work.shape_hash}] = pipe;

@@ -1,0 +1,9 @@
+{
+ "title": "Pokémon Y",
+ "title_id": "0004000000055E00",
+ "platform": "Nintendo 3DS",
+ "runtime": "https://github.com/ShiromiyaG/Bergamota",
+ "runtime_commit": "21007338e0655b675ab116273e602ff7d37e28e6",
+ "status": "beta",
+ "tested": "New game in German from the language screen through the professor's talk, the name entry on the touch screen and the bedroom scene; walking around the room, the X menu, saving, and after a restart Continue from that save. Not tested: anything after the bedroom (no battle, no outdoor area), long sessions."
+}
