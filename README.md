@@ -12,9 +12,9 @@ The runtime's author plans a port of this game of their own, **Duality (X / Y)**
 
 ## What was tested
 
-New game in German from the language screen through the professor's talk, the name entry on the touch screen and the bedroom scene; walking around the room, the X menu, saving, and after a restart Continue from that save. Not tested: anything after the bedroom (no battle, no outdoor area), long sessions.
+New game in German from the language screen through the professor's talk, the name entry on the touch screen and the bedroom scene; walking around the room, the X menu, saving, and after a restart Continue from that save. Not tested: anything after the bedroom (no battle, no outdoor area), long sessions. Also on a low-budget machine (Batocera Linux mini PC, AMD Ryzen 3 PRO 4350GE, Radeon Vega 6): the same new-game route and the Continue route, started from the system's menu, with a photo of the screen checked for each; 60 shown / 30 game pictures a second once the shaders of a scene are cached. The first time a scene is shown its shaders are compiled, which drops the game to as low as 8 to 20 pictures a second for up to a minute (measured in Pokémon X's opening); the cache is kept.
 
-Tested on Windows 11 (Intel Core i7-13700KF, NVIDIA GeForce RTX 3070 Ti) with the player in a window and
+Tested mainly on Windows 11 (Intel Core i7-13700KF, NVIDIA GeForce RTX 3070 Ti) with the player in a window and
 fullscreen, picture by picture from scripted input (`test/`), and the Linux build the same way in WSL2
 (Ubuntu 24.04, software Vulkan). The game's sound was recorded and checked to be music, not listened to.
 A gamepad was not tested here; input was scripted.
@@ -27,6 +27,7 @@ a second there, as on the console; the player draws one more between each two ("
 | Machine | Shown per second | The game's own | Idle |
 |---|---|---|---|
 | Windows 11, Intel Core i7-13700KF, NVIDIA GeForce RTX 3070 Ti | 60.3 | 30.1 | 95 % |
+| Batocera Linux mini PC (HP), AMD Ryzen 3 PRO 4350GE with Radeon Vega 6 graphics, 8 GB | 60.1 | 30.1 | 91 % |
 
 "Idle" is the share of each second the game's thread had nothing to do: the room for slower machines.
 
