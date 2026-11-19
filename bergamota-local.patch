@@ -117,7 +117,7 @@ index aa6d870..272d191 100644
              }
              if (s.video.layout == "single") {
 diff --git a/frontend/player.cpp b/frontend/player.cpp
-index bda6585..a9a8178 100644
+index bda6585..f1c7709 100644
 --- a/frontend/player.cpp
 +++ b/frontend/player.cpp
 @@ -183,11 +183,14 @@ private:
@@ -171,7 +171,79 @@ index bda6585..a9a8178 100644
      }
  };
  
-@@ -723,6 +736,43 @@ int main(int argc, char **argv) {
+@@ -494,6 +507,71 @@ private:
+     uint64_t pictures_before_ = 0, dsp_before_ = 0, dropped_before_ = 0;
+ };
+ 
++// local (tests): RUNTIME_SLOW=1 tells of each of the game's pictures that came later than
++// usual (more vertical blanks than most of the sixteen before it): where the game's thread
++// spent the time, and what the GPU's thread did meanwhile. On the game's thread.
++void slow_take(System &system, Services &services, AsyncGpu *async, VulkanRenderer &vulkan) {
++    using clock = std::chrono::steady_clock;
++    struct Before {
++        double code = 0, interpreter = 0, syscalls = 0, schedule = 0, outside = 0, idle = 0, waited = 0;
++        double vertices = 0, render = 0, sync = 0, host = 0;
++        uint64_t interpreted = 0, uploads = 0, write_backs = 0, draws = 0, translated = 0;
++        double by_svc[256]{};
++    };
++    static Before b;
++    static std::map<std::string, double> services_before;
++    static uint64_t pictures = 0, blank = 0, count = 0;
++    static int spans[16]{};
++    static const clock::time_point start = clock::now();
++    static clock::time_point at = start;
++    if (services.pictures == pictures) return;
++    pictures = services.pictures;
++    auto now = clock::now();
++    int span = int(services.vblanks - blank);
++    blank = services.vblanks;
++    int usual = 0, most = 0;
++    for (int a : spans) {
++        int n = 0;
++        for (int c : spans) n += c == a;
++        if (a > 0 && n > most) most = n, usual = a;
++    }
++    const auto &pr = system.profile;
++    const auto &st = vulkan.stats;
++    if (count >= 16 && usual > 0 && span > usual) {
++        int top = 0;
++        double top_s = 0;
++        for (int i = 0; i < 256; i++)
++            if (double d = pr.by_svc[i] - b.by_svc[i]; d > top_s) top_s = d, top = i;
++        std::string service = "none";
++        double service_s = 0;
++        for (const auto &[name, seconds] : pr.by_service)
++            if (double d = seconds - services_before[name]; d > service_s) service_s = d, service = name;
++        std::printf("slow picture at %.1f s: %d blanks (usually %d), %.0f ms: service %s %.1f, code %.1f, interpreter %.1f (%llu instructions), "
++                    "syscalls %.1f (most 0x%02X %.1f), schedule %.1f, outside %.1f, idle %.1f, waited for the GPU %.1f; "
++                    "GPU thread: vertices %.1f, render %.1f, sync %.1f, host GPU %.1f, %llu draws (%llu not translated), "
++                    "%llu uploads, %llu write-backs\n",
++                    std::chrono::duration<double>(now - start).count(), span, usual,
++                    std::chrono::duration<double, std::milli>(now - at).count(), service.c_str(), service_s * 1000,
++                    (pr.code - b.code) * 1000,
++                    (pr.interpreter - b.interpreter) * 1000, (unsigned long long)(system.interpreted - b.interpreted),
++                    (pr.syscalls - b.syscalls) * 1000, top, top_s * 1000, (pr.schedule - b.schedule) * 1000,
++                    (pr.outside - b.outside) * 1000, (system.idle - b.idle) * 1000, ((async ? async->waited : 0) - b.waited) * 1000,
++                    (st.time_vertices - b.vertices) * 1000, (st.time_render - b.render) * 1000, (st.time_sync - b.sync) * 1000,
++                    (st.gpu_seconds - b.host) * 1000, (unsigned long long)(st.draws - b.draws),
++                    (unsigned long long)((st.draws - b.draws) - (st.translated_draws - b.translated)),
++                    (unsigned long long)(st.uploads - b.uploads), (unsigned long long)(st.write_backs - b.write_backs));
++    }
++    spans[count++ % 16] = span;
++    services_before = pr.by_service;
++    at = now;
++    b.code = pr.code, b.interpreter = pr.interpreter, b.syscalls = pr.syscalls, b.schedule = pr.schedule, b.outside = pr.outside;
++    b.idle = system.idle, b.waited = async ? async->waited : 0;
++    b.vertices = st.time_vertices, b.render = st.time_render, b.sync = st.time_sync, b.host = st.gpu_seconds;
++    b.interpreted = system.interpreted, b.uploads = st.uploads, b.write_backs = st.write_backs, b.draws = st.draws;
++    b.translated = st.translated_draws;
++    for (int i = 0; i < 256; i++) b.by_svc[i] = pr.by_svc[i];
++}
++
+ } // namespace
+ 
+ #ifdef __ANDROID__
+@@ -723,6 +801,43 @@ int main(int argc, char **argv) {
                  std::lock_guard g(input_lock);
                  handlers.input = input;
              }
@@ -215,7 +287,36 @@ index bda6585..a9a8178 100644
              recorder.take(handlers.vblanks, handlers.input);
              if (!cheats_on.empty() && handlers.vblanks != cheat_blank) {
                  cheat_blank = handlers.vblanks;
-@@ -866,6 +916,20 @@ int main(int argc, char **argv) {
+@@ -740,6 +855,7 @@ int main(int argc, char **argv) {
+                 port_ui->blank(system.memory, handlers.vblanks);
+             }
+             handlers.tick(system);
++            if (static const bool slow = SDL_getenv("RUNTIME_SLOW") != nullptr; slow) slow_take(system, handlers, async.get(), vulkan);
+             feed_sound(sound, handlers.audio.output, tally.starved);
+             return quit.load(std::memory_order_relaxed);
+         });
+@@ -851,7 +967,13 @@ int main(int argc, char **argv) {
+         const int parts = between_parts(settings, window);
+         vulkan.between = parts;
+         for (Frame f; handlers.gpu->next_frame(f);) waiting.push_back(std::move(f));
+-        while (waiting.size() > 2 * size_t(std::max(parts, 1))) waiting.pop_front();
++        static const bool slow_told = SDL_getenv("RUNTIME_SLOW") != nullptr;
++        static const auto slow_start = std::chrono::steady_clock::now();
++        auto slow_at = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - slow_start).count(); };
++        while (waiting.size() > 2 * size_t(std::max(parts, 1))) {
++            if (slow_told) std::printf("a frame skipped at %.1f s (blank %llu, %zu waiting)\n", slow_at(), (unsigned long long)waiting.front().number, waiting.size());
++            waiting.pop_front();
++        }
+         // without the display's refreshes to wait for, a blank's later
+         // pictures each a part of a blank after the one before
+         if (!waiting.empty() && waiting.front().part > 0 && !settings.video.vsync) {
+@@ -862,10 +984,26 @@ int main(int argc, char **argv) {
+             }
+         }
+         bool fresh = !waiting.empty();
++        if (slow_told && !fresh && settings.video.vsync && handlers.vblanks > 0)
++            std::printf("nothing new for a refresh at %.1f s (blank %llu)\n", slow_at(), (unsigned long long)handlers.vblanks);
+         if (fresh) {
              showing = std::move(waiting.front());
              waiting.pop_front();
              dump.take(showing);
@@ -236,7 +337,7 @@ index bda6585..a9a8178 100644
          } else if (!settings.video.vsync && !overlay.open) {
              // nothing new, and no refresh to wait for
              SDL_Delay(1);
-@@ -958,8 +1022,10 @@ int main(int argc, char **argv) {
+@@ -958,8 +1096,10 @@ int main(int argc, char **argv) {
              frontend::place(view, layout, panel, settings.video.panel_size, settings.video.panel_corner, scene ? scene->lift : 0.0f);
          } else {
              ui_up = false;
@@ -311,6 +412,18 @@ index 797be39..8e47a86 100644
  public:
      explicit Services(uint64_t program_id) : program_id_(program_id) {}
  
+diff --git a/include/runtime/system.h b/include/runtime/system.h
+index 00fdcb5..3d90d6e 100644
+--- a/include/runtime/system.h
++++ b/include/runtime/system.h
+@@ -110,6 +110,7 @@ public:
+         uint64_t slices = 0, svcs = 0;
+         double by_svc[256]{};
+         std::map<uint32_t, double> by_thread; // the code's time, by thread
++        std::map<std::string, double> by_service; // local (tests): the requests' time, by service
+     } profile;
+     // where it ran, by the address it entered at
+     std::map<uint32_t, uint64_t> interpreted_at;
 diff --git a/launcher/main.cpp b/launcher/main.cpp
 index 5f1737e..fa14e1d 100644
 --- a/launcher/main.cpp
@@ -397,6 +510,45 @@ index 0a007c0..919c3f8 100644
          for (size_t page = start >> PAGE_BITS; page <= (stop - 1) >> PAGE_BITS; page++) {
              if (!guarded(page, write)) table[page] = from[page];
          }
+diff --git a/src/services/fs.cpp b/src/services/fs.cpp
+index e9ca48c..e2d755c 100644
+--- a/src/services/fs.cpp
++++ b/src/services/fs.cpp
+@@ -3,6 +3,9 @@
+ 
+ #include "runtime/fs.h"
+ 
++#include <cstdlib>
++#include <cstdio>
++#include <chrono>
+ #include <algorithm>
+ #include <cstring>
+ #include <fstream>
+@@ -468,6 +471,8 @@ bool Fs::file(System &system, Thread &thread, CommandBuffer &b, uint32_t id) {
+         uint32_t size = b.get(3), dest = b.get(5), read = 0;
+         if (f && offset < f->size()) {
+             uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(size, f->size() - offset));
++            static const bool slow_told = std::getenv("RUNTIME_SLOW") != nullptr;
++            auto slow_t0 = std::chrono::steady_clock::now();
+             std::vector<uint8_t> data(count);
+             if (f->backing == Backing::Rom) {
+                 std::ifstream in(f->rom.file, std::ios::binary);
+@@ -481,8 +486,15 @@ bool Fs::file(System &system, Thread &thread, CommandBuffer &b, uint32_t id) {
+             } else {
+                 std::memcpy(data.data(), f->bytes.data() + offset, count);
+             }
++            auto slow_t1 = std::chrono::steady_clock::now();
+             m.write_bytes(dest, data.data(), count);
+             read = count;
++            if (slow_told) {
++                auto slow_t2 = std::chrono::steady_clock::now();
++                double from = std::chrono::duration<double, std::milli>(slow_t1 - slow_t0).count();
++                double into = std::chrono::duration<double, std::milli>(slow_t2 - slow_t1).count();
++                if (from + into > 4) std::printf("slow read: %u bytes at %llu, %.1f ms from the file, %.1f ms into memory\n", count, (unsigned long long)offset, from, into);
++            }
+         }
+         b.set(0, header(command, 2, 2));
+         b.set(1, result::SUCCESS);
 diff --git a/src/services/services.cpp b/src/services/services.cpp
 index 9df4754..7a49b86 100644
 --- a/src/services/services.cpp
@@ -410,8 +562,22 @@ index 9df4754..7a49b86 100644
          if (!gsp_.next_vblank) gsp_.next_vblank = now + FRAME;
          if (now >= gsp_.next_vblank) {
              gsp_.next_vblank = std::max(gsp_.next_vblank + FRAME, now);
+diff --git a/src/system.cpp b/src/system.cpp
+index 2dbbcf9..aac2fc4 100644
+--- a/src/system.cpp
++++ b/src/system.cpp
+@@ -159,7 +159,9 @@ void System::prepare(Context &c) {
+ 
+ void System::request(Kernel &, Thread &thread, const std::string &service, uint32_t subhandle) {
+     if (services_) {
++        auto before = std::chrono::steady_clock::now();
+         services_(*this, thread, service, subhandle);
++        profile.by_service[service] += std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count();
+     } else {
+         thread.context.r[0] = result::NOT_IMPLEMENTED;
+     }
 diff --git a/src/vk/device.cpp b/src/vk/device.cpp
-index fe3877c..cc5fdb5 100644
+index fe3877c..dfc1e4b 100644
 --- a/src/vk/device.cpp
 +++ b/src/vk/device.cpp
 @@ -1,3 +1,8 @@
@@ -423,7 +589,18 @@ index fe3877c..cc5fdb5 100644
  // The Vulkan device: set up, buffers and images, recording and submitting. (impl.h)
  
  #include "impl.h"
-@@ -198,6 +203,26 @@ bool Impl::init() {
+@@ -131,6 +136,10 @@ bool Impl::init() {
+         vkGetPhysicalDeviceProperties(physical, &p);
+         api_version = std::min<uint32_t>(p.apiVersion, VK_API_VERSION_1_3);
+         vendor = p.vendorID;
++        // local: an integrated GPU interprets a vertex program slower than the CPU shades the draw
++        // (measured on a Radeon Vega 6: the pictures of a new camera shot 87-102 ms of GPU time
++        // against 35-59 ms), so the CPU's stage until the program's own shader is made
++        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !std::getenv("RUNTIME_CPU_UNTIL_MADE")) cpu_until_made = true;
+         std::fprintf(stderr, "vulkan: %s, Vulkan %u.%u, driver %08x\n", p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
+                      VK_API_VERSION_MINOR(p.apiVersion), p.driverVersion);
+     }
+@@ -198,6 +207,26 @@ bool Impl::init() {
      if (api_version < VK_API_VERSION_1_3) extensions.insert(extensions.end(), std::begin(BEFORE_1_3), std::end(BEFORE_1_3));
      if (api_version < VK_API_VERSION_1_2) extensions.insert(extensions.end(), std::begin(BEFORE_1_2), std::end(BEFORE_1_2));
      if (can_present) extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -450,7 +627,19 @@ index fe3877c..cc5fdb5 100644
      VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
      dci.pNext = &features;
      dci.queueCreateInfoCount = 1;
-@@ -702,8 +727,48 @@ VkDeviceSize Impl::take(Buffer &ring, VkDeviceSize &at, VkDeviceSize size, VkDev
+@@ -386,6 +415,11 @@ bool Impl::init() {
+         translator = std::make_unique<Translator>(device, [this](uint64_t key, bool has_depth, VkShaderModule vertex, const uint32_t *shape) {
+             return make_pipeline(key, has_depth, vertex, shape);
+         }, store_outputs);
++        if (pipeline_libraries && !std::getenv("RUNTIME_NO_LINK_NOW")) {
++            translator->link_with([this](uint64_t key, bool has_depth, VkShaderModule vertex, const uint32_t *shape) {
++                return make_pipeline(key, has_depth, vertex, shape, true);
++            });
++        }
+     }
+     begin();
+     blank = image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, false);
+@@ -702,8 +736,48 @@ VkDeviceSize Impl::take(Buffer &ring, VkDeviceSize &at, VkDeviceSize size, VkDev
      return where;
  }
  
@@ -499,7 +688,7 @@ index fe3877c..cc5fdb5 100644
      vkDeviceWaitIdle(device);
      translator.reset();
      if (pipeline_cache) {
-@@ -724,6 +789,12 @@ void Impl::shutdown() {
+@@ -724,6 +798,12 @@ void Impl::shutdown() {
      for (auto &[k, t] : textures) destroy(t.image);
      destroy(blank);
      for (auto &[k, pipe] : pipelines) vkDestroyPipeline(device, pipe, nullptr);
@@ -513,10 +702,19 @@ index fe3877c..cc5fdb5 100644
      for (Buffer &b : staging) destroy(b);
      for (Shown &sh : shown) {
 diff --git a/src/vk/draw.cpp b/src/vk/draw.cpp
-index efa8490..ea89e01 100644
+index efa8490..cc6f625 100644
 --- a/src/vk/draw.cpp
 +++ b/src/vk/draw.cpp
-@@ -109,6 +109,84 @@ VkPipeline Impl::make_pipeline(uint64_t key, bool has_depth, VkShaderModule vert
+@@ -18,7 +18,7 @@ VkPipeline Impl::pipeline(uint64_t key, bool has_depth) {
+ // as attributes, or none for the GPU's shader (key bit 41); with a shape, a
+ // fragment shader made for it. touches nothing of the renderer's, so the
+ // translator's threads make them too
+-VkPipeline Impl::make_pipeline(uint64_t key, bool has_depth, VkShaderModule vertex, const uint32_t *shape) const {
++VkPipeline Impl::make_pipeline(uint64_t key, bool has_depth, VkShaderModule vertex, const uint32_t *shape, bool only_linked) const {
+     bool on_gpu = (key >> 41) & 1, w_buffer = (key >> 42) & 1, shadow = (key >> 43) & 1;
+     if (!vertex) vertex = on_gpu ? vert_gpu : vert;
+     VkSpecializationMapEntry entries[SHAPE_SIZE];
+@@ -109,6 +109,85 @@ VkPipeline Impl::make_pipeline(uint64_t key, bool has_depth, VkShaderModule vert
      gi.pDynamicState = &dyn;
      gi.layout = layout;
      VkPipeline pipe = VK_NULL_HANDLE;
@@ -544,7 +742,7 @@ index efa8490..ea89e01 100644
 +            VkPipeline made = VK_NULL_HANDLE;
 +            vkCreateGraphicsPipelines(device, pipeline_cache, 1, &li, nullptr, &made);
 +            return made;
-+        });
++        }, only_linked);
 +        // the fragment shader of a shape (none: the one for every state): once a shape
 +        name = "F";
 +        name.push_back(shadow ? 2 : w_buffer ? 1 : 0);
@@ -565,7 +763,7 @@ index efa8490..ea89e01 100644
 +            VkPipeline made = VK_NULL_HANDLE;
 +            vkCreateGraphicsPipelines(device, pipeline_cache, 1, &li, nullptr, &made);
 +            return made;
-+        });
++        }, only_linked);
 +        // the blending and the targets
 +        name = "O";
 +        uint64_t state = key & ~(uint64_t(1) << 41);
@@ -598,11 +796,12 @@ index efa8490..ea89e01 100644
 +            pipe = VK_NULL_HANDLE;
 +        }
 +    }
++    if (only_linked) return VK_NULL_HANDLE;
      vkCreateGraphicsPipelines(device, pipeline_cache, 1, &gi, nullptr, &pipe);
      return pipe;
  }
 diff --git a/src/vk/impl.h b/src/vk/impl.h
-index e594d03..4bc3737 100644
+index e594d03..8182836 100644
 --- a/src/vk/impl.h
 +++ b/src/vk/impl.h
 @@ -22,6 +22,7 @@
@@ -613,7 +812,7 @@ index e594d03..4bc3737 100644
  #include <atomic>
  #include <mutex>
  #include <thread>
-@@ -249,6 +250,42 @@ struct VulkanRenderer::Impl {
+@@ -249,6 +250,47 @@ struct VulkanRenderer::Impl {
      VkPipeline depth_pipeline = VK_NULL_HANDLE;
      VkSampler nearest = VK_NULL_HANDLE;
      std::unordered_map<uint64_t, VkPipeline> pipelines;
@@ -623,7 +822,7 @@ index e594d03..4bc3737 100644
 +    struct Library {
 +        std::mutex making;
 +        VkPipeline pipe = VK_NULL_HANDLE;
-+        bool made = false;
++        std::atomic<bool> made{false};
 +    };
 +    // the vertex shaders of the runs before (the cache's .spv), their libraries made in the
 +    // background from the start, so the driver's cache has them before the game draws with them
@@ -633,10 +832,15 @@ index e594d03..4bc3737 100644
 +    void warm();
 +    mutable std::mutex library_lock;
 +    mutable std::map<std::string, std::shared_ptr<Library>> libraries;
-+    template <class Make> VkPipeline library(const std::string &name, Make make) const {
++    // only_made: the library if it is there, none made (and none waited for)
++    template <class Make> VkPipeline library(const std::string &name, Make make, bool only_made = false) const {
 +        std::shared_ptr<Library> l;
 +        {
 +            std::lock_guard g(library_lock);
++            if (only_made) {
++                auto it = libraries.find(name);
++                return it != libraries.end() && it->second->made.load() ? it->second->pipe : VkPipeline(VK_NULL_HANDLE);
++            }
 +            auto &slot = libraries[name];
 +            if (!slot) slot = std::make_shared<Library>();
 +            l = slot;
@@ -656,6 +860,27 @@ index e594d03..4bc3737 100644
      VkPipelineCache pipeline_cache = VK_NULL_HANDLE; // kept on disk with the translated shaders
      // the game's vertex programs as shaders of their own (translate.h);
      // RUNTIME_NO_TRANSLATE=1 keeps the interpreter
+@@ -378,7 +420,8 @@ struct VulkanRenderer::Impl {
+     // by the GPU interpreting the program: a GPU that is slow at that (a
+     // Mali, told by its vertex shaders not writing), or RUNTIME_CPU_UNTIL_MADE=1.
+     // not_made: render() left such a draw to the CPU's stage
+-    bool cpu_until_made = std::getenv("RUNTIME_CPU_UNTIL_MADE") != nullptr;
++    // (local: also on an integrated GPU, device.cpp; RUNTIME_CPU_UNTIL_MADE=0 for not)
++    bool cpu_until_made = std::getenv("RUNTIME_CPU_UNTIL_MADE") && std::getenv("RUNTIME_CPU_UNTIL_MADE")[0] != '0';
+     bool not_made = false;
+     const VkImageView *forced_views = nullptr;
+     // in a replay, a buffer read as a texture is read from its between image
+@@ -589,7 +632,9 @@ struct VulkanRenderer::Impl {
+     // -- pipelines ---------------------------------------------------------------
+ 
+     VkPipeline pipeline(uint64_t key, bool has_depth);
+-    VkPipeline make_pipeline(uint64_t key, bool has_depth, VkShaderModule vertex, const uint32_t *shape = nullptr) const;
++    // only_linked: from the libraries made already, null when one of the shaders' is not
++    VkPipeline make_pipeline(uint64_t key, bool has_depth, VkShaderModule vertex, const uint32_t *shape = nullptr,
++                             bool only_linked = false) const;
+     // the shape of a draw's state for the fragment shader (pica.frag): a
+     // pipeline made for it leaves out what it does not use (RUNTIME_GENERIC_FRAG=1:
+     // the one shader for all, to compare)
 diff --git a/src/vk/renderer.cpp b/src/vk/renderer.cpp
 index 804578f..e64e803 100644
 --- a/src/vk/renderer.cpp
@@ -669,7 +894,7 @@ index 804578f..e64e803 100644
      if (FILE *f = open_file(d.cache_folder / "pipelines.bin", "rb")) {
          std::vector<uint8_t> data;
 diff --git a/src/vk/translate.cpp b/src/vk/translate.cpp
-index a4f4848..0975190 100644
+index a4f4848..5024b43 100644
 --- a/src/vk/translate.cpp
 +++ b/src/vk/translate.cpp
 @@ -1,3 +1,6 @@
@@ -679,15 +904,308 @@ index a4f4848..0975190 100644
  // The PICA's vertex programs as GLSL (translate.h). Each instruction is
  // decoded here once: its operands, swizzles and mask are written into the
  // code, so the GPU only does the arithmetic. The flow (calls, ifs, loops,
-@@ -317,6 +320,7 @@ std::string translated_shader(const ProgramBlock &program, uint32_t entry, bool
+@@ -317,7 +320,9 @@ std::string translated_shader(const ProgramBlock &program, uint32_t entry, bool
  
  Translator::Translator(VkDevice device, MakePipeline make, bool store) : device_(device), make_(std::move(make)), store_(store) {
      unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u);
 +    if (const char *e__ = std::getenv("RUNTIME_PIPELINE_THREADS")) n = std::clamp(unsigned(std::atoi(e__)), 1u, 16u);
      for (unsigned i = 0; i < n; i++) threads_.emplace_back([this] { run(); });
++    if (!std::getenv("RUNTIME_NO_QUICK_THREAD")) threads_.emplace_back([this] { run(true); });
  }
  
-@@ -503,7 +507,15 @@ void Translator::run() {
+ Translator::~Translator() {
+@@ -341,26 +346,195 @@ void Translator::cache_in(const std::filesystem::path &folder) {
+     std::filesystem::create_directories(folder, error);
+     std::lock_guard g(lock_);
+     cache_ = folder;
++    if (!std::getenv("RUNTIME_NO_REPLAY")) {
++        Work work{};
++        work.replay = true;
++        queue_.push_back(std::move(work));
++        wake_.notify_all();
++    }
++}
++
++namespace {
++
++// pipelines.list: a word naming the format, then a record for each pipeline made
++struct Listed {
++    uint64_t shader_key, key, shape_hash;
++    uint32_t has_depth;
++    uint32_t shape[SHAPE_SIZE];
++};
++
++} // namespace
++
++std::filesystem::path Translator::shader_file(uint64_t shader_key) {
++    char name[40];
++    std::snprintf(name, sizeof name, "%016llx.spv",
++                  (unsigned long long)(shader_key ^ frame_version() ^ (store_ ? 0 : 0x4E4F53544F524531ull)));
++    return cache_ / name;
++}
++
++VkShaderModule Translator::load_cached(uint64_t shader_key) {
++    std::filesystem::path file;
++    {
++        std::lock_guard g(lock_);
++        if (cache_.empty()) return VK_NULL_HANDLE;
++        file = shader_file(shader_key);
++    }
++    std::vector<uint32_t> words;
++    if (FILE *f = open_file(file, "rb")) {
++        std::fseek(f, 0, SEEK_END);
++        long size = std::ftell(f);
++        std::fseek(f, 0, SEEK_SET);
++        if (size > 0 && size % 4 == 0) {
++            words.resize(size_t(size) / 4);
++            if (std::fread(words.data(), 4, words.size(), f) != words.size()) words.clear();
++        }
++        std::fclose(f);
++    }
++    if (words.empty()) return VK_NULL_HANDLE;
++    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++    smi.codeSize = words.size() * 4;
++    smi.pCode = words.data();
++    VkShaderModule module = VK_NULL_HANDLE;
++    if (vkCreateShaderModule(device_, &smi, nullptr, &module) != VK_SUCCESS) return VK_NULL_HANDLE;
++    return module;
++}
++
++void Translator::note(uint64_t shader_key, uint64_t key, bool has_depth, const uint32_t *shape, uint64_t shape_hash) {
++    if (cache_.empty() || !listed_.insert({shader_key, key, shape_hash}).second) return;
++    const std::filesystem::path file = cache_ / "pipelines.list";
++    const uint64_t format = frame_version() ^ (store_ ? 0 : 0x4E4F53544F524531ull) ^ sizeof(Listed);
++    std::error_code error;
++    const bool begun = std::filesystem::file_size(file, error) >= sizeof format && !error;
++    FILE *f = open_file(file, begun ? "ab" : "wb");
++    if (!f) return;
++    if (!begun) std::fwrite(&format, sizeof format, 1, f);
++    Listed l{};
++    l.shader_key = shader_key, l.key = key, l.shape_hash = shape_hash, l.has_depth = has_depth;
++    if (shape_hash && shape) std::memcpy(l.shape, shape, sizeof l.shape);
++    std::fwrite(&l, sizeof l, 1, f);
++    std::fclose(f);
++}
++
++// the pipelines of the runs before, queued behind what the game asks for now:
++// made (from the driver's cache, quickly) before the game draws with them
++void Translator::replay() {
++    std::filesystem::path file;
++    {
++        std::lock_guard g(lock_);
++        file = cache_ / "pipelines.list";
++    }
++    std::vector<Listed> list;
++    const uint64_t format = frame_version() ^ (store_ ? 0 : 0x4E4F53544F524531ull) ^ sizeof(Listed);
++    bool stale = false;
++    if (FILE *f = open_file(file, "rb")) {
++        uint64_t has = 0;
++        if (std::fread(&has, sizeof has, 1, f) == 1 && has == format) {
++            Listed l;
++            while (std::fread(&l, sizeof l, 1, f) == 1) list.push_back(l);
++        } else {
++            stale = true;
++        }
++        std::fclose(f);
++    }
++    // another frame's: its shaders are not these, the list starts again
++    if (stale) {
++        std::error_code error;
++        std::filesystem::remove(file, error);
++    }
++    size_t queued = 0, shaders = 0;
++    for (const Listed &l : list) {
++        {
++            std::lock_guard g(lock_);
++            if (stop_) return;
++            if (!listed_.insert({l.shader_key, l.key, l.shape_hash}).second) continue;
++        }
++        if (l.shader_key) {
++            bool known;
++            {
++                std::lock_guard g(lock_);
++                known = shaders_.count(l.shader_key) != 0;
++            }
++            if (!known) {
++                VkShaderModule module = load_cached(l.shader_key);
++                if (!module) continue; // its file is gone: translated again when the game draws with it
++                std::lock_guard g(lock_);
++                if (shaders_.count(l.shader_key)) {
++                    vkDestroyShaderModule(device_, module, nullptr); // the game asked meanwhile
++                } else {
++                    Shader &shader = shaders_[l.shader_key];
++                    shader.module = module;
++                    shader.done = true;
++                    loaded++, shaders++;
++                }
++            }
++        }
++        std::lock_guard g(lock_);
++        if (l.shader_key) {
++            auto it = shaders_.find(l.shader_key);
++            if (it == shaders_.end() || !it->second.done || it->second.failed) continue;
++        }
++        if (!pipelines_.try_emplace(Which{l.shader_key, l.key, l.shape_hash}, VK_NULL_HANDLE).second) continue;
++        Work work{};
++        work.shader_key = l.shader_key, work.key = l.key, work.has_depth = l.has_depth != 0, work.shape_hash = l.shape_hash;
++        std::memcpy(work.shape.data(), l.shape, sizeof l.shape);
++        later_.push_back(std::move(work));
++        queued++;
++        wake_.notify_all();
++    }
++    {
++        std::lock_guard g(lock_);
++        replayed += queued;
++    }
++    if (std::getenv("RUNTIME_STATS"))
++        std::printf("replaying %zu pipelines of the runs before (%zu listed, %zu shaders loaded for them)\n", queued, list.size(), shaders);
+ }
+ 
+ VkPipeline Translator::pipeline(const std::shared_ptr<const ProgramBlock> &program, uint64_t program_hash, uint32_t entry,
+                                 uint64_t key, bool has_depth) {
+     uint64_t shader_key = Translator::shader_key(program_hash, entry);
++    const Which which{shader_key, key, 0};
++    VkShaderModule module = VK_NULL_HANDLE;
++    {
++        std::lock_guard g(lock_);
++        auto it = shaders_.find(shader_key);
++        if (it == shaders_.end()) {
++            shaders_[shader_key];
++            queue_.push_back({program, shader_key, entry, 0, false, {}, 0});
++            wake_.notify_all();
++            return VK_NULL_HANDLE;
++        }
++        if (!it->second.done || it->second.failed) return VK_NULL_HANDLE;
++        auto pipe = pipelines_.find(which);
++        if (pipe != pipelines_.end() && pipe->second) return pipe->second;
++        if (!link_) {
++            if (pipe == pipelines_.end()) {
++                pipelines_[which] = VK_NULL_HANDLE;
++                queue_.push_back({nullptr, shader_key, entry, key, has_depth, {}, 0});
++                wake_.notify_all();
++            }
++            return VK_NULL_HANDLE;
++        }
++        module = it->second.module;
++    }
++    // its parts made already: linked here and now, no draw with the stand-in
++    VkPipeline linked = link_(key, has_depth, module, nullptr);
+     std::lock_guard g(lock_);
+-    auto it = shaders_.find(shader_key);
+-    if (it == shaders_.end()) {
+-        shaders_[shader_key];
+-        queue_.push_back({program, shader_key, entry, 0, false, {}, 0});
+-        wake_.notify_one();
+-        return VK_NULL_HANDLE;
++    auto [slot, fresh] = pipelines_.try_emplace(which, VK_NULL_HANDLE);
++    if (linked) {
++        if (slot->second) {
++            vkDestroyPipeline(device_, linked, nullptr); // a worker made it meanwhile
++        } else {
++            slot->second = linked;
++            pipelines_made++, linked_now++;
++            note(shader_key, key, has_depth, nullptr, 0);
++        }
++        return slot->second;
+     }
+-    if (!it->second.done || it->second.failed) return VK_NULL_HANDLE;
+-    auto pipe = pipelines_.find({shader_key, key, 0});
+-    if (pipe != pipelines_.end()) return pipe->second;
+-    pipelines_[{shader_key, key, 0}] = VK_NULL_HANDLE;
+-    queue_.push_back({nullptr, shader_key, entry, key, has_depth, {}, 0});
+-    wake_.notify_one();
+-    return VK_NULL_HANDLE;
++    if (fresh) {
++        queue_.push_back({nullptr, shader_key, entry, key, has_depth, {}, 0});
++        wake_.notify_all();
++    }
++    return slot->second;
+ }
+ 
+ VkPipeline Translator::specialized(uint64_t shader_key, uint64_t key, bool has_depth, const Shape &shape, uint64_t shape_hash,
+@@ -368,13 +542,38 @@ VkPipeline Translator::specialized(uint64_t shader_key, uint64_t key, bool has_d
+     std::unique_lock g(lock_);
+     const std::tuple<uint64_t, uint64_t, uint64_t> which{shader_key, key, shape_hash};
+     auto pipe = pipelines_.find(which);
+-    if (pipe != pipelines_.end() && (pipe->second || !wait)) return pipe->second;
++    if (pipe != pipelines_.end() && pipe->second) return pipe->second;
++    // its parts made already (this shape's shader with another blending, say):
++    // linked here and now
++    if (link_ && !failed_.count(which)) {
++        VkShaderModule module = VK_NULL_HANDLE;
++        if (shader_key) {
++            auto it = shaders_.find(shader_key);
++            if (it != shaders_.end()) module = it->second.module;
++        }
++        g.unlock();
++        VkPipeline linked = link_(key, has_depth, module, shape.data());
++        g.lock();
++        pipe = pipelines_.find(which);
++        if (linked) {
++            if (pipe != pipelines_.end() && pipe->second) {
++                vkDestroyPipeline(device_, linked, nullptr); // a worker made it meanwhile
++                return pipe->second;
++            }
++            pipelines_[which] = linked;
++            pipelines_made++, linked_now++;
++            note(shader_key, key, has_depth, shape.data(), shape_hash);
++            made_.notify_all();
++            return linked;
++        }
++    }
++    if (pipe != pipelines_.end() && !wait) return pipe->second;
+     if (pipe == pipelines_.end()) {
+         pipelines_[which] = VK_NULL_HANDLE;
+         // waited for: before the ones nothing waits for
+         if (wait) later_.push_front({nullptr, shader_key, 0, key, has_depth, shape, shape_hash});
+         else later_.push_back({nullptr, shader_key, 0, key, has_depth, shape, shape_hash});
+-        wake_.notify_one();
++        wake_.notify_all();
+     }
+     if (!wait) return VK_NULL_HANDLE;
+     made_.wait(g, [&] { return stop_ || pipelines_[which] || failed_.count(which); });
+@@ -417,7 +616,7 @@ void step_back() {
+ 
+ } // namespace
+ 
+-void Translator::run() {
++void Translator::run(bool quick) {
+     step_back();
+     Spirv spirv;
+     const char *dump = std::getenv("RUNTIME_DUMP_SHADERS");
+@@ -425,11 +624,27 @@ void Translator::run() {
+         Work work;
+         {
+             std::unique_lock g(lock_);
+-            wake_.wait(g, [this] { return stop_ || !queue_.empty() || !later_.empty(); });
++            auto own = [](const Work &w) { return !w.program && !w.replay && w.shader_key == 0; };
++            std::deque<Work>::iterator mine;
++            wake_.wait(g, [&] {
++                if (stop_) return true;
++                if (!quick) return !queue_.empty() || !later_.empty();
++                mine = std::find_if(later_.begin(), later_.end(), own);
++                return mine != later_.end();
++            });
+             if (stop_) break;
+-            auto &from = queue_.empty() ? later_ : queue_;
+-            work = std::move(from.front());
+-            from.pop_front();
++            if (quick) {
++                work = std::move(*mine);
++                later_.erase(mine);
++            } else {
++                auto &from = queue_.empty() ? later_ : queue_;
++                work = std::move(from.front());
++                from.pop_front();
++            }
++        }
++        if (work.replay) {
++            replay();
++            continue;
+         }
+         if (work.program) {
+             // made before, in another run
+@@ -503,11 +718,26 @@ void Translator::run() {
              std::lock_guard g(lock_);
              module = shaders_[work.shader_key].module;
          }
@@ -702,4 +1220,63 @@ index a4f4848..0975190 100644
 +        }
          if (!pipe) std::fprintf(stderr, "a pipeline was not made\n");
          std::lock_guard g(lock_);
-         pipelines_[{work.shader_key, work.key, work.shape_hash}] = pipe;
+-        pipelines_[{work.shader_key, work.key, work.shape_hash}] = pipe;
+-        pipelines_made++;
++        if (VkPipeline &slot = pipelines_[{work.shader_key, work.key, work.shape_hash}]; slot) {
++            // the GPU's thread linked it meanwhile: that one is in use
++            if (pipe) vkDestroyPipeline(device_, pipe, nullptr);
++            pipe = slot;
++        } else {
++            slot = pipe;
++            pipelines_made++;
++        }
++        if (pipe) note(work.shader_key, work.key, work.has_depth, work.shape_hash ? work.shape.data() : nullptr, work.shape_hash);
+         if (work.shape_hash) {
+             if (!pipe) failed_.insert({work.shader_key, work.key, work.shape_hash});
+             made_.notify_all();
+diff --git a/src/vk/translate.h b/src/vk/translate.h
+index 25d2121..f46c087 100644
+--- a/src/vk/translate.h
++++ b/src/vk/translate.h
+@@ -63,8 +63,14 @@ public:
+         return program_hash ^ (uint64_t(entry) + 1) * 0x9E3779B97F4A7C15ull;
+     }
+ 
+-    // the shaders made kept in folder, as <key>.spv, and taken from there
++    // the shaders made kept in folder, as <key>.spv, and taken from there;
++    // and the pipelines made listed there (pipelines.list), those of the
++    // runs before made again in the background from now
+     void cache_in(const std::filesystem::path &folder);
++    // link(...) as make, but only from parts made already (null otherwise),
++    // quick enough for the GPU's thread: a pipeline it gives is used at once
++    void link_with(MakePipeline link) { link_ = std::move(link); }
++    uint64_t linked_now = 0, replayed = 0;
+ 
+     uint64_t compiled = 0, loaded = 0, failed = 0, pipelines_made = 0;
+ 
+@@ -77,12 +83,24 @@ private:
+         bool has_depth;
+         Shape shape;       // and a shape, when shape_hash is not 0
+         uint64_t shape_hash;
++        bool replay = false; // or: the list of the runs before, to queue
+     };
++    using Which = std::tuple<uint64_t, uint64_t, uint64_t>;
++    void replay();
++    // the shader's module from the cache's file, if it is there
++    VkShaderModule load_cached(uint64_t shader_key);
++    // a pipeline made, for the list (lock_ held)
++    void note(uint64_t shader_key, uint64_t key, bool has_depth, const uint32_t *shape, uint64_t shape_hash);
++    std::filesystem::path shader_file(uint64_t shader_key);
++    MakePipeline link_;
++    std::set<Which> listed_;
+     struct Shader {
+         VkShaderModule module = VK_NULL_HANDLE;
+         bool done = false, failed = false;
+     };
+-    void run();
++    // quick: only the pipelines with the renderer's own vertex shader, never
++    // behind a translated one the driver takes long over
++    void run(bool quick = false);
+ 
+     VkDevice device_;
+     MakePipeline make_;
